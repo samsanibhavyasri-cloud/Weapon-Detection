@@ -9,19 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 import base64
-import threading
-from collections import deque
 from datetime import datetime
-
-try:
-    import av
-    from streamlit_webrtc import WebRtcMode, webrtc_streamer
-    WEBRTC_AVAILABLE = True
-except Exception:
-    av = None
-    WebRtcMode = None
-    webrtc_streamer = None
-    WEBRTC_AVAILABLE = False
 
 import numpy as np
 from PIL import Image
@@ -58,23 +46,12 @@ TEAM_MEMBERS = [
     "S. Anusha"
 ]
 
-DEFAULT_CONFIDENCE = 0.45
-DEFAULT_REQUIRED_FRAMES = 3
+DEFAULT_CONFIDENCE = 0.60
+DEFAULT_REQUIRED_FRAMES = 5
 
-# Detection tuning. Image mode uses multi-scale agreement for better
-# recall without trusting a single noisy prediction. Video/live mode
-# additionally require temporal agreement before declaring a weapon.
-IMAGE_CONFIDENCE_FLOOR = 0.45
-VIDEO_CONFIDENCE_FLOOR = 0.50
-LIVE_CONFIDENCE_FLOOR = 0.55
-IMAGE_PRIMARY_IMGSZ = 640
-IMAGE_SECONDARY_IMGSZ = 960
-VIDEO_IMGSZ = 640
-LIVE_IMGSZ = 416
-MIN_BOX_AREA_RATIO = 0.0005
-LIVE_MIN_BOX_AREA_RATIO = 0.0010
-TEMPORAL_WINDOW = 5
-TEMPORAL_HITS = 3
+# Very small boxes are ignored. This helps reduce
+# random tiny false detections.
+MIN_BOX_AREA_RATIO = 0.0015
 
 # Phone/SMS alert settings. Keep credentials in Windows environment
 # variables instead of writing them directly in app.py.
@@ -287,11 +264,6 @@ if not os.path.exists(MODEL_PATH):
     st.stop()
 
 model = load_model()
-MODEL_NAMES = {int(k): str(v) for k, v in model.names.items()}
-WEAPON_CLASS_ID = next((k for k, v in MODEL_NAMES.items() if v.lower().strip() == "weapon"), None)
-if WEAPON_CLASS_ID is None:
-    st.error(f"❌ This best.pt model does not contain a 'weapon' class. Loaded classes: {MODEL_NAMES}")
-    st.stop()
 
 
 # ============================================================
@@ -417,90 +389,78 @@ def build_alert_message(source, confidence, event_time=None):
 # DETECT WEAPONS IN ONE FRAME
 # ============================================================
 
-def _box_iou(box_a, box_b):
-    ax1, ay1, ax2, ay2 = box_a
-    bx1, by1, bx2, by2 = box_b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-    inter = iw * ih
-    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-    union = area_a + area_b - inter
-    return inter / union if union > 0 else 0.0
+def detect_weapons(frame, confidence_threshold):
 
+    output = frame.copy()
+    detections = []
 
-def _raw_weapon_detections(frame, confidence, imgsz, min_area_ratio=MIN_BOX_AREA_RATIO):
-    """Run YOLO and return only weapon boxes; no drawing is done here."""
     h, w = frame.shape[:2]
     frame_area = max(1, h * w)
+
     results = model(
         frame,
-        conf=confidence,
-        imgsz=imgsz,
-        classes=[WEAPON_CLASS_ID],
+        conf=confidence_threshold,
         verbose=False
     )
-    detections = []
+
     for result in results:
+
         if result.boxes is None:
             continue
+
         for box in result.boxes:
-            confidence_value = float(box.conf[0])
+
+            confidence = float(box.conf[0])
             class_id = int(box.cls[0])
             class_name = str(model.names[class_id]).lower().strip()
+
             if class_name != "weapon":
                 continue
+
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+
             box_area = max(0, x2 - x1) * max(0, y2 - y1)
-            if box_area / frame_area < min_area_ratio:
+            area_ratio = box_area / frame_area
+
+            # Ignore extremely tiny detections.
+            if area_ratio < MIN_BOX_AREA_RATIO:
                 continue
-            detections.append({"box": (x1, y1, x2, y2), "confidence": confidence_value})
-    return detections
 
+            detections.append({
+                "box": (x1, y1, x2, y2),
+                "confidence": confidence
+            })
 
-def _draw_weapon_detections(frame, detections):
-    output = frame.copy()
+    # Draw every accepted weapon detection.
     for det in detections:
+
         x1, y1, x2, y2 = det["box"]
         confidence = det["confidence"]
-        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        cv2.putText(output, f"WEAPON {confidence:.2f}", (x1, max(30, y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    return output
 
+        cv2.rectangle(
+            output,
+            (x1, y1),
+            (x2, y2),
+            (0, 0, 255),
+            3
+        )
 
-def detect_weapons(frame, confidence_threshold, mode="image"):
-    """Reliable detector shared by image/video modes.
+        cv2.putText(
+            output,
+            f"WEAPON {confidence:.2f}",
+            (x1, max(30, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2
+        )
 
-    Image mode requires agreement between 640 and 960 inference when the
-    confidence is not already very high. Video mode uses a stricter floor;
-    temporal confirmation is handled by process_video.
-    """
-    if mode == "image":
-        floor = max(float(confidence_threshold), IMAGE_CONFIDENCE_FLOOR)
-        first = _raw_weapon_detections(frame, max(0.20, floor - 0.20), IMAGE_PRIMARY_IMGSZ)
-        second = _raw_weapon_detections(frame, max(0.20, floor - 0.20), IMAGE_SECONDARY_IMGSZ)
-        accepted = []
-        used = set()
-        for d1 in first:
-            matches = [(idx, d2) for idx, d2 in enumerate(second)
-                       if idx not in used and _box_iou(d1["box"], d2["box"]) >= 0.25]
-            if matches:
-                idx, d2 = max(matches, key=lambda x: x[1]["confidence"])
-                used.add(idx)
-                score = max(d1["confidence"], d2["confidence"])
-                if score >= floor:
-                    accepted.append({"box": d2["box"], "confidence": score})
-            elif d1["confidence"] >= 0.78:
-                accepted.append(d1)
-        detections = accepted
-    else:
-        floor = max(float(confidence_threshold), VIDEO_CONFIDENCE_FLOOR)
-        detections = _raw_weapon_detections(frame, floor, VIDEO_IMGSZ)
-    detections.sort(key=lambda d: d["confidence"], reverse=True)
-    highest = detections[0]["confidence"] if detections else 0.0
-    return _draw_weapon_detections(frame, detections), detections, highest
+    highest = max(
+        [d["confidence"] for d in detections],
+        default=0.0
+    )
+
+    return output, detections, highest
 
 
 # ============================================================
@@ -729,48 +689,6 @@ def create_alarm_video(
 
 
 # ============================================================
-# NORMALIZE INPUT VIDEO
-# ============================================================
-
-def normalize_video_for_processing(input_path, output_path):
-    """
-    Convert AVI/MKV/MOV/MP4 and unusual codecs into a stable
-    H.264 MP4 that OpenCV and the browser can read reliably.
-    Video is normalized without audio because audio is added later
-    by the alarm-video step.
-    """
-    command = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        output_path
-    ]
-
-    try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=900
-        )
-        if (
-            result.returncode == 0
-            and os.path.exists(output_path)
-            and os.path.getsize(output_path) > 0
-        ):
-            return True, ""
-        return False, result.stderr[-5000:]
-    except Exception as e:
-        return False, str(e)
-
-
-# ============================================================
 # VIDEO PROCESSING
 # ============================================================
 
@@ -780,23 +698,19 @@ def process_video(
     confidence_threshold,
     required_frames
 ):
-    """
-    Process a normalized H.264 video frame-by-frame.
-    The preview is updated periodically instead of on every frame,
-    which prevents the Streamlit UI from becoming unstable/slow.
-    """
 
     cap = cv2.VideoCapture(input_path)
 
     if not cap.isOpened():
         return {
             "success": False,
-            "error": "Could not open the video for frame processing."
+            "error": "Could not open the uploaded video."
         }
 
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or math.isnan(fps) or fps <= 0:
-        fps = 25.0
+
+    if fps <= 0:
+        fps = 25
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -806,10 +720,13 @@ def process_video(
         cap.release()
         return {
             "success": False,
-            "error": "The video has invalid width/height."
+            "error": "Invalid video dimensions."
         }
 
+    # MP4 written temporarily. FFmpeg later converts it to
+    # proper browser-compatible H.264.
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
     writer = cv2.VideoWriter(
         silent_output,
         fourcc,
@@ -821,55 +738,68 @@ def process_video(
         cap.release()
         return {
             "success": False,
-            "error": "Could not create the processed output video."
+            "error": "Could not create output video."
         }
 
     frame_number = 0
     consecutive_frames = 0
     was_confirmed = False
+
+    confirmed_frames = 0
     highest_confidence = 0.0
+
     detection_events = []
-    recent_hits = deque(maxlen=TEMPORAL_WINDOW)
 
     progress = st.progress(0)
     status = st.empty()
     preview = st.empty()
 
-    # Updating Streamlit too frequently can make long videos appear
-    # frozen or interfere with the UI. Preview only every ~10 frames.
-    preview_interval = max(1, int(round(fps / 3)))
-
     try:
+
         while True:
+
             success, frame = cap.read()
+
             if not success:
                 break
 
             frame_number += 1
 
-            _, detections, highest = detect_weapons(
+            output, detections, highest = detect_weapons(
                 frame,
-                confidence_threshold,
-                mode="video"
+                confidence_threshold
             )
-            output = frame.copy()
-
-            # Require repeated evidence, not one noisy CCTV frame.
-            recent_hits.append(bool(detections))
-            hit_count = sum(recent_hits)
-            confirmed = len(recent_hits) >= TEMPORAL_WINDOW and hit_count >= max(required_frames, TEMPORAL_HITS)
 
             if detections:
-                highest_confidence = max(highest_confidence, highest)
 
-            # Create exactly one event when a new confirmed detection starts.
+                consecutive_frames += 1
+                highest_confidence = max(
+                    highest_confidence,
+                    highest
+                )
+
+            else:
+
+                consecutive_frames = 0
+
+            confirmed = (
+                consecutive_frames >= required_frames
+            )
+
+            # ------------------------------------------------
+            # NEW CONFIRMED DETECTION EVENT
+            # ------------------------------------------------
+
             if confirmed and not was_confirmed:
+
                 time_sec = frame_number / fps
 
                 detection_events.append({
                     "time": round(time_sec, 2),
                     "confidence": round(highest, 3)
                 })
+
+                confirmed_frames += 1
 
                 save_detection_log(
                     "CCTV Video",
@@ -879,65 +809,77 @@ def process_video(
 
             was_confirmed = confirmed
 
+            # ------------------------------------------------
+            # DISPLAY BANNER
+            # ------------------------------------------------
+
             if confirmed:
-                output = _draw_weapon_detections(frame, detections)
+
                 output = add_banner(
                     output,
-                    "WEAPON DETECTED",
+                    "🚨 WEAPON DETECTED",
                     (0, 0, 180)
                 )
+
                 status.error(
                     f"🚨 WEAPON DETECTED | "
-                    f"Confidence: {highest:.2%} | "
-                    f"Video time: {frame_number / fps:.1f}s"
+                    f"Confidence: {highest:.2%}"
                 )
+
             elif detections:
+
                 output = add_banner(
                     output,
                     "VERIFYING POSSIBLE WEAPON...",
                     (0, 120, 220)
                 )
+
                 status.warning(
-                    f"🔎 Possible weapon detected - verifying "
-                    f"({consecutive_frames}/{required_frames})"
+                    "🔎 Possible weapon detected - verifying..."
                 )
+
             else:
+
                 output = add_banner(
                     output,
                     "NO WEAPON DETECTED",
                     (0, 80, 0)
                 )
 
+                status.success(
+                    "✅ No confirmed weapon in this frame"
+                )
+
             writer.write(output)
 
-            if frame_number % preview_interval == 0 or frame_number == 1:
-                preview_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
-                preview.image(
-                    preview_rgb,
-                    channels="RGB",
-                    use_container_width=True
-                )
+            # ------------------------------------------------
+            # PREVIEW
+            # ------------------------------------------------
+
+            preview_rgb = cv2.cvtColor(
+                output,
+                cv2.COLOR_BGR2RGB
+            )
+
+            preview.image(
+                preview_rgb,
+                channels="RGB",
+                use_container_width=True
+            )
 
             if total_frames > 0:
-                progress.progress(
-                    min(frame_number / total_frames, 1.0)
+
+                value = min(
+                    frame_number / total_frames,
+                    1.0
                 )
 
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Video processing error: {e}"
-        }
+                progress.progress(value)
 
     finally:
+
         cap.release()
         writer.release()
-
-    if not os.path.exists(silent_output) or os.path.getsize(silent_output) == 0:
-        return {
-            "success": False,
-            "error": "The processed video file was empty."
-        }
 
     progress.progress(1.0)
     preview.empty()
@@ -1094,8 +1036,7 @@ def image_detection(confidence_threshold):
             image_array,
             cv2.COLOR_RGB2BGR
         ),
-        confidence_threshold,
-        mode="image"
+        confidence_threshold
     )
 
     output_rgb = cv2.cvtColor(
@@ -1161,6 +1102,7 @@ def video_detection(
     confidence_threshold,
     required_frames
 ):
+
     st.subheader("🎥 CCTV Video Detection")
 
     uploaded = st.file_uploader(
@@ -1172,76 +1114,58 @@ def video_detection(
     if uploaded is None:
         return
 
+    # --------------------------------------------------------
+    # SAVE INPUT
+    # --------------------------------------------------------
+
+    input_temp = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".mp4"
+    )
+
+    input_temp.write(
+        uploaded.getbuffer()
+    )
+
+    input_temp.close()
+
+    input_path = input_temp.name
+
+    # --------------------------------------------------------
+    # SHOW INPUT BEFORE PROCESSING
+    # --------------------------------------------------------
+
+    st.markdown("### 📥 Input CCTV Video")
+    st.video(
+        uploaded.getvalue()
+    )
+
+    st.write("")
+
     if not st.button(
         "🚀 START WEAPON DETECTION",
         type="primary",
         use_container_width=True,
         key="start_video_detection"
     ):
-        # Show the uploaded video only after a compatible preview
-        # can be prepared, avoiding broken MKV/AVI browser playback.
-        st.info("Video uploaded. Click START WEAPON DETECTION.")
         return
+
+    # --------------------------------------------------------
+    # CHECK FFMPEG
+    # --------------------------------------------------------
 
     if not ffmpeg_available():
+
         st.error(
-            "❌ FFmpeg is not available. Please restart PowerShell "
-            "after installing FFmpeg and run the app again."
+            """
+            ❌ FFmpeg is not available.
+
+            Install FFmpeg and add it to Windows PATH.
+            Then restart PowerShell and run the app again.
+            """
         )
+
         return
-
-    # --------------------------------------------------------
-    # SAVE UPLOAD WITH THE REAL EXTENSION
-    # --------------------------------------------------------
-
-    original_name = uploaded.name or "cctv_video.mp4"
-    original_ext = os.path.splitext(original_name)[1].lower()
-
-    if original_ext not in [".mp4", ".avi", ".mov", ".mkv"]:
-        original_ext = ".mp4"
-
-    input_temp = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=original_ext
-    )
-    input_temp.write(uploaded.getbuffer())
-    input_temp.close()
-    original_path = input_temp.name
-
-    # --------------------------------------------------------
-    # NORMALIZE VIDEO FIRST
-    # --------------------------------------------------------
-
-    normalized_temp = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix="_normalized.mp4"
-    )
-    normalized_temp.close()
-    normalized_path = normalized_temp.name
-
-    try:
-        os.remove(normalized_path)
-    except Exception:
-        pass
-
-    st.markdown("### 📥 Input CCTV Video")
-    st.info("🔄 Preparing the uploaded video for stable AI processing...")
-
-    normalize_ok, normalize_error = normalize_video_for_processing(
-        original_path,
-        normalized_path
-    )
-
-    if not normalize_ok:
-        st.error("❌ Could not read/convert the uploaded video.")
-        with st.expander("FFmpeg details"):
-            st.code(normalize_error)
-        return
-
-    with open(normalized_path, "rb") as f:
-        normalized_input_bytes = f.read()
-
-    st.video(normalized_input_bytes)
 
     # --------------------------------------------------------
     # TEMP OUTPUTS
@@ -1251,24 +1175,35 @@ def video_detection(
         delete=False,
         suffix="_silent.mp4"
     )
+
     silent_temp.close()
+
     silent_path = silent_temp.name
 
     final_temp = tempfile.NamedTemporaryFile(
         delete=False,
         suffix="_alarm.mp4"
     )
+
     final_temp.close()
+
     final_path = final_temp.name
 
     browser_temp = tempfile.NamedTemporaryFile(
         delete=False,
         suffix="_browser.mp4"
     )
+
     browser_temp.close()
+
     browser_path = browser_temp.name
 
-    for path in [silent_path, final_path, browser_path]:
+    # Remove placeholder files so FFmpeg can create them.
+    for path in [
+        silent_path,
+        final_path,
+        browser_path
+    ]:
         try:
             os.remove(path)
         except Exception:
@@ -1278,57 +1213,55 @@ def video_detection(
     # PROCESS
     # --------------------------------------------------------
 
-    st.markdown("### 🔄 AI Processing")
-    st.caption(
-        "The video is being analyzed frame-by-frame. "
-        "Please keep this page open until processing finishes."
-    )
+    st.markdown("### 🔄 Processing video...")
 
     result = process_video(
-        normalized_path,
+        input_path,
         silent_path,
         confidence_threshold,
         required_frames
     )
 
     if not result.get("success"):
+
         st.error(
             "❌ " + result.get(
                 "error",
                 "Video processing failed."
             )
         )
+
         return
 
     events = result["events"]
     weapon_found = len(events) > 0
 
     # --------------------------------------------------------
-    # PHONE ALERT
+    # PHONE ALERTS
     # --------------------------------------------------------
 
     sms_results = []
-
     if weapon_found and SMS_ENABLED:
-        # One SMS per uploaded video, not one SMS per frame/event.
-        first_event = events[0]
-        message = build_alert_message(
-            "CCTV Video",
-            float(first_event.get("confidence", 0.0)),
-            float(first_event.get("time", 0.0))
-        )
-
-        sent, sms_status = send_phone_alert(message)
-        sms_results.append(sms_status)
+        for event in events:
+            message = build_alert_message(
+                "CCTV Video",
+                float(event.get("confidence", 0.0)),
+                float(event.get("time", 0.0))
+            )
+            sent, sms_status = send_phone_alert(message)
+            sms_results.append(sms_status)
+            if sent:
+                break
 
     # --------------------------------------------------------
     # CREATE ALARM VIDEO
     # --------------------------------------------------------
 
     if weapon_found:
+
         st.warning(
             "🚨 Confirmed weapon detected. "
-            "Adding alarm sound to the output video..."
+            "Adding alarm sound to output video..."
         )
 
         alarm_ok, alarm_error = create_alarm_video(
@@ -1338,21 +1271,37 @@ def video_detection(
         )
 
         if not alarm_ok:
-            st.error("❌ Could not create alarm video.")
-            with st.expander("FFmpeg details"):
+
+            st.error(
+                "❌ Could not create alarm video."
+            )
+
+            with st.expander(
+                "FFmpeg details"
+            ):
                 st.code(alarm_error)
+
             return
 
         output_path = final_path
-        st.success("🔊 Alarm sound added to the detected event(s).")
+
+        st.success(
+            "🔊 Alarm sound added to the detected "
+            "weapon event(s)."
+        )
+
     else:
+
+        # No weapon = no alarm.
         output_path = silent_path
 
     # --------------------------------------------------------
-    # BROWSER-COMPATIBLE OUTPUT
+    # CONVERT FINAL OUTPUT FOR BROWSER
     # --------------------------------------------------------
 
-    st.info("🎬 Preparing the final browser-compatible video...")
+    st.info(
+        "🎬 Preparing browser-compatible output video..."
+    )
 
     ok, conversion_error = encode_browser_video(
         output_path,
@@ -1360,34 +1309,64 @@ def video_detection(
     )
 
     if not ok:
-        st.error("❌ Browser-compatible video conversion failed.")
-        with st.expander("FFmpeg details"):
+
+        st.error(
+            "❌ Browser-compatible video conversion failed."
+        )
+
+        with st.expander(
+            "FFmpeg details"
+        ):
             st.code(conversion_error)
+
         return
 
     # --------------------------------------------------------
-    # SIDE-BY-SIDE
+    # SIDE-BY-SIDE VIDEO
     # --------------------------------------------------------
 
     st.markdown("---")
     st.markdown("## 🎬 Input vs AI Detection")
 
-    col1, col2 = st.columns(2, gap="large")
+    col1, col2 = st.columns(
+        2,
+        gap="large"
+    )
 
     with col1:
+
         st.markdown("### 📥 Input CCTV Video")
-        st.video(normalized_input_bytes)
+
+        with open(
+            input_path,
+            "rb"
+        ) as f:
+            input_bytes = f.read()
+
+        st.video(
+            input_bytes
+        )
 
     with col2:
-        if weapon_found:
-            st.markdown("### 🚨 Output — Weapon Detected")
-        else:
-            st.markdown("### ✅ Output — No Weapon Detected")
 
-        with open(browser_path, "rb") as f:
+        if weapon_found:
+            st.markdown(
+                "### 🚨 Output — Weapon Detected"
+            )
+        else:
+            st.markdown(
+                "### ✅ Output — No Weapon Detected"
+            )
+
+        with open(
+            browser_path,
+            "rb"
+        ) as f:
             output_bytes = f.read()
 
-        st.video(output_bytes)
+        st.video(
+            output_bytes
+        )
 
         st.download_button(
             "⬇️ Download Output Video",
@@ -1404,6 +1383,7 @@ def video_detection(
     st.markdown("---")
 
     if weapon_found:
+
         st.markdown(
             f"""
             <div class="wg-danger">
@@ -1419,21 +1399,17 @@ def video_detection(
         )
 
         st.markdown("### 🔊 Test Alarm Sound")
+
         show_alarm_player()
 
         if SMS_ENABLED:
-            if sms_results and any(
-                "successfully" in x.lower()
-                for x in sms_results
-            ):
-                st.success(
-                    "📱 Phone alert: SMS sent to the configured "
-                    "security/owner number."
-                )
+            if sms_results and any("successfully" in x.lower() for x in sms_results):
+                st.success("📱 Phone alert: SMS sent to the configured security/owner number.")
             elif sms_results:
                 st.warning("📱 Phone alert: " + sms_results[0])
 
     else:
+
         st.markdown(
             """
             <div class="wg-safe">
@@ -1443,97 +1419,170 @@ def video_detection(
             unsafe_allow_html=True
         )
 
-    # Clean temporary files after the output has been loaded into memory.
-    for path in [
-        original_path,
-        normalized_path,
-        silent_path,
-        final_path,
-        browser_path
-    ]:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-
 
 # ============================================================
 # LIVE CAMERA
 # ============================================================
 
-def live_detection(confidence_threshold, required_frames):
-    """Browser webcam detection with temporal confirmation and low latency."""
+def live_detection(
+    confidence_threshold,
+    required_frames
+):
+
     st.subheader("📹 Live Camera Detection")
 
-    if not WEBRTC_AVAILABLE:
-        st.error("Live camera requires streamlit-webrtc and av in requirements.txt.")
-        return
-
-    st.info("Live mode uses browser camera input. A single frame can never trigger a weapon alert.")
-    state = {"frame": 0, "history": deque(maxlen=TEMPORAL_WINDOW),
-             "was_confirmed": False, "last_alert": 0.0}
-    lock = threading.Lock()
-
-    def send_sms(confidence):
-        now = time.time()
-        with lock:
-            if now - state["last_alert"] < SMS_COOLDOWN_SECONDS:
-                return
-            state["last_alert"] = now
-        _send_twilio_sms(build_alert_message("Browser Live Camera", confidence))
-
-    def callback(frame):
-        image = frame.to_ndarray(format="bgr24")
-        state["frame"] += 1
-        # Process every second frame to reduce delay while keeping the camera fluid.
-        if state["frame"] % 2 == 0 or not state["history"]:
-            detections = _raw_weapon_detections(
-                image,
-                max(float(confidence_threshold), LIVE_CONFIDENCE_FLOOR),
-                LIVE_IMGSZ,
-                min_area_ratio=LIVE_MIN_BOX_AREA_RATIO
-            )
-            state["history"].append(detections)
-
-        hit_count = sum(bool(x) for x in state["history"])
-        confirmed = len(state["history"]) >= TEMPORAL_WINDOW and hit_count >= max(required_frames, TEMPORAL_HITS)
-
-        if confirmed:
-            best = max((d for group in state["history"] for d in group),
-                       key=lambda d: d["confidence"], default=None)
-            output = _draw_weapon_detections(image, [best] if best else [])
-            output = add_banner(output, "WEAPON DETECTED", (0, 0, 180))
-            if not state["was_confirmed"] and best and SMS_ENABLED:
-                threading.Thread(target=send_sms, args=(best["confidence"],), daemon=True).start()
-        elif state["history"] and state["history"][-1]:
-            output = add_banner(image.copy(), "VERIFYING...", (0, 105, 210))
-        else:
-            output = add_banner(image.copy(), "NO WEAPON DETECTED", (0, 80, 0))
-
-        state["was_confirmed"] = confirmed
-        return av.VideoFrame.from_ndarray(output, format="bgr24")
-
-    webrtc_ctx = webrtc_streamer(
-        key="weaponguard-browser-live-v4",
-        mode=WebRtcMode.SENDRECV,
-        video_frame_callback=callback,
-        media_stream_constraints={
-            "video": {"width": {"ideal": 640, "max": 640},
-                      "height": {"ideal": 480, "max": 480},
-                      "frameRate": {"ideal": 15, "max": 15}},
-            "audio": False
-        },
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        async_processing=False,
-        media_toggle_controls=False
+    st.info(
+        """
+        This version uses OpenCV directly.
+        Click START LIVE DETECTION to open your webcam.
+        Press Q or ESC inside the camera window to stop.
+        """
     )
 
-    if webrtc_ctx.state.playing:
-        st.success(f"🟢 CAMERA ACTIVE • YOLO ACTIVE • LIVE FILTER ≥ {max(confidence_threshold, LIVE_CONFIDENCE_FLOOR):.0%}")
-    else:
-        st.info("⚪ Camera ready — click START and allow camera access.")
+    if not st.button(
+        "📹 START LIVE DETECTION",
+        type="primary",
+        use_container_width=True,
+        key="start_live"
+    ):
+        return
 
-    st.caption("Live: 640×480 @ 15 FPS • YOLO 416 • confirmation: 3 of 5 inference frames")
+    camera = cv2.VideoCapture(
+        0,
+        cv2.CAP_DSHOW
+    )
+
+    if not camera.isOpened():
+
+        camera.release()
+
+        camera = cv2.VideoCapture(
+            1,
+            cv2.CAP_DSHOW
+        )
+
+    if not camera.isOpened():
+
+        st.error(
+            """
+            ❌ Could not open webcam.
+
+            Check Windows camera permission and make sure
+            another application is not using the camera.
+            """
+        )
+
+        return
+
+    camera.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        640
+    )
+
+    camera.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        480
+    )
+
+    camera.set(
+        cv2.CAP_PROP_FPS,
+        30
+    )
+
+    consecutive = 0
+    last_log = 0
+    was_confirmed = False
+
+    st.success(
+        "🟢 Camera started. Press Q or ESC to stop."
+    )
+
+    while True:
+
+        success, frame = camera.read()
+
+        if not success:
+            break
+
+        output, detections, highest = detect_weapons(
+            frame,
+            confidence_threshold
+        )
+
+        if detections:
+            consecutive += 1
+        else:
+            consecutive = 0
+
+        confirmed = (
+            consecutive >= required_frames
+        )
+
+        if confirmed:
+
+            # Send only once when a new confirmed event starts.
+            if not was_confirmed and SMS_ENABLED:
+                sms_message = build_alert_message(
+                    "Live Camera",
+                    highest
+                )
+                send_phone_alert(sms_message)
+
+            output = add_banner(
+                output,
+                "🚨 WEAPON CONFIRMED",
+                (0, 0, 180)
+            )
+
+            now = time.time()
+
+            if now - last_log >= 5:
+
+                save_detection_log(
+                    "Live Camera",
+                    highest,
+                    len(detections)
+                )
+
+                last_log = now
+
+        elif detections:
+
+            output = add_banner(
+                output,
+                "VERIFYING...",
+                (0, 120, 220)
+            )
+
+        else:
+
+            output = add_banner(
+                output,
+                "NO WEAPON DETECTED",
+                (0, 80, 0)
+            )
+
+        was_confirmed = confirmed
+
+        cv2.imshow(
+            "WeaponGuard AI - LIVE DETECTION",
+            output
+        )
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q") or key == 27:
+            break
+
+    camera.release()
+    cv2.destroyAllWindows()
+
+    for _ in range(3):
+        cv2.waitKey(1)
+
+    st.success(
+        "🟢 Live Detection stopped."
+    )
 
 
 # ============================================================
@@ -1613,7 +1662,7 @@ def detection_page():
 
         confidence = st.slider(
             "🎯 Confidence Threshold",
-            min_value=0.30,
+            min_value=0.40,
             max_value=0.95,
             value=DEFAULT_CONFIDENCE,
             step=0.05
@@ -1628,8 +1677,8 @@ def detection_page():
         )
 
         st.caption(
-            "Image uses multi-scale agreement. Video/live require repeated evidence. "
-            "Higher confidence reduces false alarms."
+            "Higher confidence + more consecutive frames "
+            "can reduce false alarms."
         )
 
         st.divider()
@@ -1672,8 +1721,10 @@ def detection_page():
     )
 
     st.markdown(
-        "AI-powered weapon detection using YOLO",
-        help="AI-based weapon detection using image, CCTV video, and live camera analysis."
+        '<div class="wg-subtitle">'
+        'AI-powered weapon detection'
+        '</div>',
+        unsafe_allow_html=True
     )
 
     tab1, tab2, tab3, tab4 = st.tabs(
