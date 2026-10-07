@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 import base64
 import threading
+from collections import deque
 from datetime import datetime
 
 try:
@@ -64,6 +65,16 @@ DEFAULT_REQUIRED_FRAMES = 2
 # Very small boxes are ignored. This helps reduce
 # random tiny false detections.
 MIN_BOX_AREA_RATIO = 0.0003
+
+# Live-camera performance and false-positive protection.
+# Live mode is intentionally stricter than image/video mode because
+# real-time webcam input is more sensitive to transient false detections.
+LIVE_CONFIDENCE_FLOOR = 0.60
+LIVE_IMGSZ = 416
+LIVE_INFER_EVERY = 2
+LIVE_CONFIRM_WINDOW = 5
+LIVE_CONFIRM_HITS = 3
+LIVE_MIN_BOX_AREA_RATIO = 0.0010
 
 # Phone/SMS alert settings. Keep credentials in Windows environment
 # variables instead of writing them directly in app.py.
@@ -1436,13 +1447,85 @@ def video_detection(
 # ============================================================
 # LIVE CAMERA - BROWSER WEBCAM
 # ============================================================
+def detect_live_weapons(frame, confidence_threshold):
+    """Fast/strict detector used only by the browser live camera.
+
+    It uses a smaller inference size for lower latency and a stricter
+    confidence/box-area filter to reduce webcam false positives.
+    """
+    output = frame.copy()
+    detections = []
+
+    h, w = frame.shape[:2]
+    frame_area = max(1, h * w)
+
+    live_conf = max(float(confidence_threshold), LIVE_CONFIDENCE_FLOOR)
+
+    # Keep the server-side inference image small enough for real-time use.
+    inference_frame = frame
+    max_width = 640
+    if w > max_width:
+        scale = max_width / float(w)
+        inference_frame = cv2.resize(
+            frame,
+            (max_width, max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA
+        )
+
+    results = model(
+        inference_frame,
+        conf=live_conf,
+        imgsz=LIVE_IMGSZ,
+        verbose=False
+    )
+
+    inf_h, inf_w = inference_frame.shape[:2]
+    sx = w / max(1, inf_w)
+    sy = h / max(1, inf_h)
+
+    for result in results:
+        if result.boxes is None:
+            continue
+
+        for box in result.boxes:
+            confidence = float(box.conf[0])
+            class_id = int(box.cls[0])
+            class_name = str(model.names[class_id]).lower().strip()
+
+            if class_name != "weapon":
+                continue
+
+            ix1, iy1, ix2, iy2 = map(int, box.xyxy[0])
+
+            x1 = max(0, min(w - 1, int(ix1 * sx)))
+            y1 = max(0, min(h - 1, int(iy1 * sy)))
+            x2 = max(0, min(w - 1, int(ix2 * sx)))
+            y2 = max(0, min(h - 1, int(iy2 * sy)))
+
+            box_area = max(0, x2 - x1) * max(0, y2 - y1)
+            area_ratio = box_area / frame_area
+
+            # Ignore tiny/transient regions that are commonly produced
+            # around faces, ears, background objects, etc.
+            if area_ratio < LIVE_MIN_BOX_AREA_RATIO:
+                continue
+
+            detections.append({
+                "box": (x1, y1, x2, y2),
+                "confidence": confidence
+            })
+
+    highest = max(
+        [d["confidence"] for d in detections],
+        default=0.0
+    )
+
+    return output, detections, highest
+
+
 
 def live_detection(confidence_threshold, required_frames):
-    """Real-time browser webcam detection using WebRTC.
-
-    The camera is accessed by the user's browser, not by the Streamlit server.
-    This is the correct approach for a deployed HTTPS Streamlit application.
-    """
+    """Low-latency browser webcam detection using WebRTC."""
 
     st.markdown(
         """
@@ -1451,8 +1534,9 @@ def live_detection(confidence_threshold, required_frames):
                 📹 Live Camera Detection
             </div>
             <div class="wg-small">
-                Real-time weapon detection from your browser camera using YOLO.
-                Click <b>START</b>, allow camera access, and keep the page open.
+                Real-time YOLO detection from your browser camera.
+                Live mode uses a stricter filter to avoid false alarms
+                from faces, ears, fans, and background objects.
             </div>
         </div>
         """,
@@ -1461,27 +1545,20 @@ def live_detection(confidence_threshold, required_frames):
 
     if not WEBRTC_AVAILABLE:
         st.error(
-            "⚠️ Live camera is not loaded yet. The deployed app is missing "
-            "the WebRTC packages. Add `streamlit-webrtc` and `av` to "
-            "requirements.txt and redeploy the app."
-        )
-        st.info(
-            "After redeployment, this section will show the actual browser "
-            "camera feed with the YOLO detection boxes and status banner."
+            "⚠️ Live camera is not available. Add `streamlit-webrtc` "
+            "and `av` to requirements.txt and redeploy."
         )
         return
 
-    # --------------------------------------------------------
-    # LIVE DETECTION STATE
-    # --------------------------------------------------------
-
+    # Use a bounded history instead of trusting one webcam frame.
+    # A detection must be present in 3 of the last 5 inference frames.
     state = {
-        "consecutive": 0,
+        "frame_count": 0,
+        "history": deque(maxlen=LIVE_CONFIRM_WINDOW),
+        "last_confirmed_box": None,
+        "last_confirmed_conf": 0.0,
         "was_confirmed": False,
-        "last_alert_time": 0.0,
-        "frames": 0,
-        "detections": 0,
-        "last_confidence": 0.0
+        "last_alert_time": 0.0
     }
     alert_lock = threading.Lock()
 
@@ -1509,137 +1586,204 @@ def live_detection(confidence_threshold, required_frames):
 
     def video_frame_callback(frame):
         image = frame.to_ndarray(format="bgr24")
-        state["frames"] += 1
+        state["frame_count"] += 1
 
-        # Keep inference resolution consistent and browser-friendly.
-        output, detections, highest = detect_weapons(
-            image,
-            confidence_threshold
+        # IMPORTANT FOR LOW LATENCY:
+        # Do not let slow YOLO inference run on every camera frame.
+        # The WebRTC worker is synchronous, so frames do not build up
+        # behind a long inference queue.
+        run_inference = (
+            state["frame_count"] == 1
+            or state["frame_count"] % LIVE_INFER_EVERY == 0
         )
 
-        state["last_confidence"] = highest
+        if run_inference:
+            _, detections, highest = detect_live_weapons(
+                image,
+                confidence_threshold
+            )
 
-        if detections:
-            state["detections"] += 1
-            state["consecutive"] += 1
-        else:
-            state["consecutive"] = 0
+            state["history"].append(
+                {
+                    "detected": bool(detections),
+                    "confidence": highest,
+                    "box": detections[0]["box"] if detections else None
+                }
+            )
 
-        confirmed = state["consecutive"] >= required_frames
+        recent = list(state["history"])
+        hit_count = sum(1 for item in recent if item["detected"])
 
-        # One SMS when a new confirmed detection begins.
-        if confirmed and not state["was_confirmed"] and SMS_ENABLED:
-            threading.Thread(
-                target=send_live_sms,
-                args=(highest,),
-                daemon=True
-            ).start()
+        confirmed = (
+            len(recent) >= LIVE_CONFIRM_WINDOW
+            and hit_count >= LIVE_CONFIRM_HITS
+        )
 
-        # Clear, camera-visible status banner.
+        # Only show a detection box after temporal confirmation.
         if confirmed:
-            output = add_banner(
-                output,
-                "🚨 WEAPON DETECTED",
+            confirmed_items = [
+                item for item in recent
+                if item["detected"]
+            ]
+
+            best_item = max(
+                confirmed_items,
+                key=lambda item: item["confidence"]
+            )
+
+            state["last_confirmed_box"] = best_item["box"]
+            state["last_confirmed_conf"] = best_item["confidence"]
+
+            x1, y1, x2, y2 = state["last_confirmed_box"]
+
+            cv2.rectangle(
+                image,
+                (x1, y1),
+                (x2, y2),
+                (0, 0, 255),
+                3
+            )
+
+            cv2.putText(
+                image,
+                f"WEAPON {state['last_confirmed_conf']:.2f}",
+                (x1, max(30, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2
+            )
+
+            image = add_banner(
+                image,
+                "WEAPON DETECTED",
                 (0, 0, 180)
             )
-        elif detections:
-            output = add_banner(
-                output,
-                "⚠️ VERIFYING POSSIBLE WEAPON...",
-                (0, 120, 220)
-            )
+
+            if not state["was_confirmed"] and SMS_ENABLED:
+                threading.Thread(
+                    target=send_live_sms,
+                    args=(state["last_confirmed_conf"],),
+                    daemon=True
+                ).start()
+
         else:
-            output = add_banner(
-                output,
-                "✓ NO WEAPON DETECTED",
-                (0, 80, 0)
-            )
+            # Do not carry an old box into the current camera frame.
+            state["last_confirmed_box"] = None
+
+            if recent and recent[-1]["detected"]:
+                image = add_banner(
+                    image,
+                    "VERIFYING...",
+                    (0, 105, 210)
+                )
+            else:
+                image = add_banner(
+                    image,
+                    "NO WEAPON DETECTED",
+                    (0, 80, 0)
+                )
 
         state["was_confirmed"] = confirmed
 
         return av.VideoFrame.from_ndarray(
-            output,
+            image,
             format="bgr24"
         )
 
-    # --------------------------------------------------------
-    # CAMERA PANEL
-    # --------------------------------------------------------
-
     st.markdown("### 🎥 Your Camera")
+
     st.caption(
-        "The START button below opens your browser camera. "
-        "Select Allow when Chrome asks for camera permission."
+        "Click START and allow camera access. "
+        "Live mode is optimized to minimize delay and false alarms."
     )
 
     webrtc_ctx = webrtc_streamer(
-        key="weaponguard-browser-live-v2",
+        key="weaponguard-browser-live-v3",
         mode=WebRtcMode.SENDRECV,
         video_frame_callback=video_frame_callback,
+
+        # Lower camera FPS reduces network/CPU load without making
+        # the display feel slow.
         media_stream_constraints={
-            "video": True,
+            "video": {
+                "width": {"ideal": 640, "max": 640},
+                "height": {"ideal": 480, "max": 480},
+                "frameRate": {"ideal": 15, "max": 15}
+            },
             "audio": False
         },
+
         rtc_configuration={
             "iceServers": [
                 {"urls": ["stun:stun.l.google.com:19302"]}
             ]
         },
-        async_processing=True
+
+        # Synchronous processing prevents a slow YOLO callback from
+        # accumulating old frames and producing a 1–2 second delay.
+        async_processing=False,
+
+        media_toggle_controls=False
     )
 
-    # --------------------------------------------------------
-    # STATUS CARDS
-    # --------------------------------------------------------
-
-    st.markdown("### 🛡️ Detection Status")
+    st.markdown("### 🛡️ Live Detection Status")
 
     if webrtc_ctx.state.playing:
         c1, c2, c3 = st.columns(3)
+
         with c1:
             st.success("🟢 CAMERA ACTIVE")
+
         with c2:
-            st.info("🤖 YOLO DETECTION ACTIVE")
+            st.success("🤖 YOLO ACTIVE")
+
         with c3:
-            if SMS_ENABLED:
-                st.success("📱 SMS ALERT ON")
-            else:
-                st.warning("📱 SMS ALERT OFF")
+            st.success(
+                f"🎯 LIVE FILTER ≥ {max(confidence_threshold, LIVE_CONFIDENCE_FLOOR):.0%}"
+            )
     else:
         c1, c2, c3 = st.columns(3)
+
         with c1:
             st.info("⚪ CAMERA READY")
+
         with c2:
             st.info("🤖 YOLO READY")
+
         with c3:
-            if SMS_ENABLED:
-                st.success("📱 SMS ALERT ON")
-            else:
-                st.warning("📱 SMS ALERT OFF")
+            st.info(
+                f"🎯 LIVE FILTER ≥ {max(confidence_threshold, LIVE_CONFIDENCE_FLOOR):.0%}"
+            )
 
     st.markdown(
         f"""
         <div class="wg-card" style="margin-top:14px;">
             <div style="font-size:18px;font-weight:700;margin-bottom:8px;">
-                ⚙️ Current Live Settings
+                ⚙️ Live Performance Settings
             </div>
             <div class="wg-small">
-                🎯 Confidence: <b>{confidence_threshold:.0%}</b>
-                &nbsp;&nbsp;•&nbsp;&nbsp;
-                🎞️ Consecutive frames: <b>{required_frames}</b>
-                &nbsp;&nbsp;•&nbsp;&nbsp;
-                📷 Input: <b>Browser Webcam</b>
+                🎯 Minimum live confidence:
+                <b>{max(confidence_threshold, LIVE_CONFIDENCE_FLOOR):.0%}</b>
+                &nbsp; • &nbsp;
+                🔍 Inference size:
+                <b>{LIVE_IMGSZ}</b>
+                &nbsp; • &nbsp;
+                🎞️ Confirmation:
+                <b>{LIVE_CONFIRM_HITS} of {LIVE_CONFIRM_WINDOW}</b>
+                &nbsp; • &nbsp;
+                📷 Camera:
+                <b>640×480 @ 15 FPS</b>
             </div>
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    st.warning(
-        "🔒 Camera video is accessed only after you grant browser permission. "
-        "The deployed app must be opened using its HTTPS Streamlit URL."
+    st.info(
+        "ℹ️ Live mode is intentionally stricter than Image/Video Detection. "
+        "A single frame is never enough to trigger WEAPON DETECTED."
     )
-
 
 
 # ============================================================
