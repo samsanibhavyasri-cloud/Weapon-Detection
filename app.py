@@ -1438,24 +1438,21 @@ def video_detection(
 # ============================================================
 
 def live_detection(confidence_threshold, required_frames):
-    """Run YOLO on the user's browser webcam through WebRTC.
+    """Real-time browser webcam detection using WebRTC.
 
-    This is intentionally browser-based. It does not use cv2.VideoCapture(0),
-    so it can work when the Streamlit app is hosted remotely over HTTPS.
+    The camera is accessed by the user's browser, not by the Streamlit server.
+    This is the correct approach for a deployed HTTPS Streamlit application.
     """
-
-    st.subheader("📹 Live Camera Detection")
 
     st.markdown(
         """
-        <div class="wg-card">
-            <div style="font-size:22px;font-weight:700;margin-bottom:8px;">
-                🌐 Browser Live Camera
+        <div class="wg-card" style="margin-top:8px;">
+            <div style="font-size:26px;font-weight:800;margin-bottom:6px;">
+                📹 Live Camera Detection
             </div>
             <div class="wg-small">
-                Your browser camera is streamed securely to WeaponGuard AI for
-                real-time YOLO detection. Click <b>START</b> and choose
-                <b>Allow</b> when the camera permission appears.
+                Real-time weapon detection from your browser camera using YOLO.
+                Click <b>START</b>, allow camera access, and keep the page open.
             </div>
         </div>
         """,
@@ -1464,17 +1461,27 @@ def live_detection(confidence_threshold, required_frames):
 
     if not WEBRTC_AVAILABLE:
         st.error(
-            "Live browser camera is not available because the WebRTC dependencies "
-            "are missing. Add streamlit-webrtc and av to requirements.txt, then redeploy."
+            "⚠️ Live camera is not loaded yet. The deployed app is missing "
+            "the WebRTC packages. Add `streamlit-webrtc` and `av` to "
+            "requirements.txt and redeploy the app."
+        )
+        st.info(
+            "After redeployment, this section will show the actual browser "
+            "camera feed with the YOLO detection boxes and status banner."
         )
         return
 
-    # State belongs to this WebRTC callback, not st.session_state, because
-    # video callbacks execute in a separate worker thread.
+    # --------------------------------------------------------
+    # LIVE DETECTION STATE
+    # --------------------------------------------------------
+
     state = {
         "consecutive": 0,
         "was_confirmed": False,
-        "last_alert_time": 0.0
+        "last_alert_time": 0.0,
+        "frames": 0,
+        "detections": 0,
+        "last_confidence": 0.0
     }
     alert_lock = threading.Lock()
 
@@ -1502,22 +1509,25 @@ def live_detection(confidence_threshold, required_frames):
 
     def video_frame_callback(frame):
         image = frame.to_ndarray(format="bgr24")
+        state["frames"] += 1
 
+        # Keep inference resolution consistent and browser-friendly.
         output, detections, highest = detect_weapons(
             image,
             confidence_threshold
         )
 
+        state["last_confidence"] = highest
+
         if detections:
+            state["detections"] += 1
             state["consecutive"] += 1
         else:
             state["consecutive"] = 0
 
-        confirmed = (
-            state["consecutive"] >= required_frames
-        )
+        confirmed = state["consecutive"] >= required_frames
 
-        # Trigger one SMS when a new confirmed event starts.
+        # One SMS when a new confirmed detection begins.
         if confirmed and not state["was_confirmed"] and SMS_ENABLED:
             threading.Thread(
                 target=send_live_sms,
@@ -1525,22 +1535,23 @@ def live_detection(confidence_threshold, required_frames):
                 daemon=True
             ).start()
 
+        # Clear, camera-visible status banner.
         if confirmed:
             output = add_banner(
                 output,
-                "WEAPON DETECTED",
+                "🚨 WEAPON DETECTED",
                 (0, 0, 180)
             )
         elif detections:
             output = add_banner(
                 output,
-                "VERIFYING POSSIBLE WEAPON...",
+                "⚠️ VERIFYING POSSIBLE WEAPON...",
                 (0, 120, 220)
             )
         else:
             output = add_banner(
                 output,
-                "NO WEAPON DETECTED",
+                "✓ NO WEAPON DETECTED",
                 (0, 80, 0)
             )
 
@@ -1551,13 +1562,18 @@ def live_detection(confidence_threshold, required_frames):
             format="bgr24"
         )
 
+    # --------------------------------------------------------
+    # CAMERA PANEL
+    # --------------------------------------------------------
+
+    st.markdown("### 🎥 Your Camera")
     st.caption(
-        "🔒 Camera access stays under your browser's permission. "
-        "For the deployed app, use the HTTPS Streamlit URL."
+        "The START button below opens your browser camera. "
+        "Select Allow when Chrome asks for camera permission."
     )
 
     webrtc_ctx = webrtc_streamer(
-        key="weaponguard-browser-live",
+        key="weaponguard-browser-live-v2",
         mode=WebRtcMode.SENDRECV,
         video_frame_callback=video_frame_callback,
         media_stream_constraints={
@@ -1572,71 +1588,57 @@ def live_detection(confidence_threshold, required_frames):
         async_processing=True
     )
 
-    if SMS_ENABLED:
-        st.success(
-            "📱 Twilio SMS alerts are enabled. A confirmed new weapon event "
-            "can trigger an SMS."
-        )
-    else:
-        st.info(
-            "📱 SMS alerts are disabled. Configure the Twilio environment "
-            "variables to receive phone alerts."
-        )
+    # --------------------------------------------------------
+    # STATUS CARDS
+    # --------------------------------------------------------
+
+    st.markdown("### 🛡️ Detection Status")
 
     if webrtc_ctx.state.playing:
-        st.success(
-            "🟢 Live detection is running. Keep this tab open."
-        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.success("🟢 CAMERA ACTIVE")
+        with c2:
+            st.info("🤖 YOLO DETECTION ACTIVE")
+        with c3:
+            if SMS_ENABLED:
+                st.success("📱 SMS ALERT ON")
+            else:
+                st.warning("📱 SMS ALERT OFF")
     else:
-        st.info(
-            "Click START above to begin browser camera detection."
-        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.info("⚪ CAMERA READY")
+        with c2:
+            st.info("🤖 YOLO READY")
+        with c3:
+            if SMS_ENABLED:
+                st.success("📱 SMS ALERT ON")
+            else:
+                st.warning("📱 SMS ALERT OFF")
 
+    st.markdown(
+        f"""
+        <div class="wg-card" style="margin-top:14px;">
+            <div style="font-size:18px;font-weight:700;margin-bottom:8px;">
+                ⚙️ Current Live Settings
+            </div>
+            <div class="wg-small">
+                🎯 Confidence: <b>{confidence_threshold:.0%}</b>
+                &nbsp;&nbsp;•&nbsp;&nbsp;
+                🎞️ Consecutive frames: <b>{required_frames}</b>
+                &nbsp;&nbsp;•&nbsp;&nbsp;
+                📷 Input: <b>Browser Webcam</b>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-# ============================================================
-# LOGS
-# ============================================================
-
-def show_logs():
-
-    st.subheader("📋 Detection Logs")
-
-    if not os.path.exists(LOG_FILE):
-
-        st.info("No detection logs yet.")
-        return
-
-    try:
-
-        with open(
-            LOG_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            logs = json.load(f)
-
-        if isinstance(logs, dict):
-            logs = logs.get(
-                "detections",
-                [logs]
-            )
-
-        if not logs:
-
-            st.info("No detection logs yet.")
-            return
-
-        st.dataframe(
-            list(reversed(logs)),
-            use_container_width=True
-        )
-
-    except Exception as e:
-
-        st.warning(
-            f"Could not read logs: {e}"
-        )
+    st.warning(
+        "🔒 Camera video is accessed only after you grant browser permission. "
+        "The deployed app must be opened using its HTTPS Streamlit URL."
+    )
 
 
 # ============================================================
