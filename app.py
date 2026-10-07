@@ -1719,7 +1719,7 @@ def detection_page():
 
         confidence = st.slider(
             "🎯 Confidence Threshold",
-            min_value=0.40,
+            min_value=0.20,
             max_value=0.95,
             value=DEFAULT_CONFIDENCE,
             step=0.05
