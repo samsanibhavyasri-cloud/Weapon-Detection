@@ -3,3 +3,5 @@ opencv-python-headless
 ultralytics
 numpy
 Pillow
+streamlit-webrtc>=0.78.1
+av>=15.1.0
