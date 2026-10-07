@@ -1641,6 +1641,40 @@ def live_detection(confidence_threshold, required_frames):
     )
 
 
+
+# ============================================================
+# LOGS
+# ============================================================
+
+def show_logs():
+    """Display saved weapon-detection events safely."""
+    st.subheader("📋 Detection Logs")
+
+    if not os.path.exists(LOG_FILE):
+        st.info("No detection logs yet.")
+        return
+
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            logs = json.load(f)
+
+        if isinstance(logs, dict):
+            logs = logs.get("detections", [logs])
+
+        if not isinstance(logs, list) or not logs:
+            st.info("No detection logs yet.")
+            return
+
+        st.dataframe(
+            list(reversed(logs)),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+        st.warning(f"Could not read detection logs: {e}")
+
+
 # ============================================================
 # DETECTION PAGE
 # ============================================================
