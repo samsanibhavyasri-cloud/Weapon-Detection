@@ -9,7 +9,19 @@ import time
 import urllib.parse
 import urllib.request
 import base64
+import threading
 from datetime import datetime
+
+try:
+    import av
+    from streamlit_webrtc import WebRtcMode, VideoProcessorBase, webrtc_streamer
+    WEBRTC_AVAILABLE = True
+except Exception:
+    av = None
+    WebRtcMode = None
+    VideoProcessorBase = object
+    webrtc_streamer = None
+    WEBRTC_AVAILABLE = False
 
 import numpy as np
 from PIL import Image
@@ -312,8 +324,8 @@ def save_detection_log(source, confidence, count=1):
 # PHONE / SMS ALERT
 # ============================================================
 
-def send_phone_alert(message, force=False):
-    """Send an SMS using Twilio when a confirmed weapon event occurs."""
+def _send_twilio_sms(message):
+    """Low-level Twilio SMS sender. Safe to call outside Streamlit's script thread."""
 
     if not SMS_ENABLED:
         return False, "SMS alerts are disabled."
@@ -330,10 +342,6 @@ def send_phone_alert(message, force=False):
 
     if missing:
         return False, "Missing environment variables: " + ", ".join(missing)
-
-    now = time.time()
-    if not force and now - st.session_state.last_sms_alert_time < SMS_COOLDOWN_SECONDS:
-        return False, "SMS cooldown is active."
 
     url = (
         "https://api.twilio.com/2010-04-01/Accounts/"
@@ -363,11 +371,23 @@ def send_phone_alert(message, force=False):
         with urllib.request.urlopen(request, timeout=15) as response:
             status = response.status
             if 200 <= status < 300:
-                st.session_state.last_sms_alert_time = now
                 return True, "SMS alert sent successfully."
             return False, f"Twilio returned HTTP {status}."
     except Exception as e:
         return False, f"SMS sending failed: {e}"
+
+
+def send_phone_alert(message, force=False):
+    """Send an SMS using Twilio with a Streamlit-session cooldown."""
+
+    now = time.time()
+    if not force and now - st.session_state.last_sms_alert_time < SMS_COOLDOWN_SECONDS:
+        return False, "SMS cooldown is active."
+
+    sent, status = _send_twilio_sms(message)
+    if sent:
+        st.session_state.last_sms_alert_time = now
+    return sent, status
 
 
 def build_alert_message(source, confidence, event_time=None):
@@ -1414,168 +1434,163 @@ def video_detection(
 
 
 # ============================================================
-# LIVE CAMERA
+# LIVE CAMERA - BROWSER WEBCAM
 # ============================================================
 
-def live_detection(
-    confidence_threshold,
-    required_frames
-):
+def live_detection(confidence_threshold, required_frames):
+    """Run YOLO on the user's browser webcam through WebRTC.
+
+    This is intentionally browser-based. It does not use cv2.VideoCapture(0),
+    so it can work when the Streamlit app is hosted remotely over HTTPS.
+    """
 
     st.subheader("📹 Live Camera Detection")
 
-    st.info(
+    st.markdown(
         """
-        This version uses OpenCV directly.
-        Click START LIVE DETECTION to open your webcam.
-        Press Q or ESC inside the camera window to stop.
-        """
+        <div class="wg-card">
+            <div style="font-size:22px;font-weight:700;margin-bottom:8px;">
+                🌐 Browser Live Camera
+            </div>
+            <div class="wg-small">
+                Your browser camera is streamed securely to WeaponGuard AI for
+                real-time YOLO detection. Click <b>START</b> and choose
+                <b>Allow</b> when the camera permission appears.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-    if not st.button(
-        "📹 START LIVE DETECTION",
-        type="primary",
-        use_container_width=True,
-        key="start_live"
-    ):
-        return
-
-    camera = cv2.VideoCapture(
-        0,
-        cv2.CAP_DSHOW
-    )
-
-    if not camera.isOpened():
-
-        camera.release()
-
-        camera = cv2.VideoCapture(
-            1,
-            cv2.CAP_DSHOW
-        )
-
-    if not camera.isOpened():
-
+    if not WEBRTC_AVAILABLE:
         st.error(
-            """
-            ❌ Could not open webcam.
-
-            Check Windows camera permission and make sure
-            another application is not using the camera.
-            """
+            "Live browser camera is not available because the WebRTC dependencies "
+            "are missing. Add streamlit-webrtc and av to requirements.txt, then redeploy."
         )
-
         return
 
-    camera.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        640
-    )
+    # State belongs to this WebRTC callback, not st.session_state, because
+    # video callbacks execute in a separate worker thread.
+    state = {
+        "consecutive": 0,
+        "was_confirmed": False,
+        "last_alert_time": 0.0
+    }
+    alert_lock = threading.Lock()
 
-    camera.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        480
-    )
+    def send_live_sms(confidence):
+        now = time.time()
 
-    camera.set(
-        cv2.CAP_PROP_FPS,
-        30
-    )
+        with alert_lock:
+            if now - state["last_alert_time"] < SMS_COOLDOWN_SECONDS:
+                return
+            state["last_alert_time"] = now
 
-    consecutive = 0
-    last_log = 0
-    was_confirmed = False
+        message = build_alert_message(
+            "Browser Live Camera",
+            confidence
+        )
 
-    st.success(
-        "🟢 Camera started. Press Q or ESC to stop."
-    )
+        sent, _ = _send_twilio_sms(message)
 
-    while True:
+        if sent:
+            save_detection_log(
+                "Browser Live Camera",
+                confidence,
+                1
+            )
 
-        success, frame = camera.read()
-
-        if not success:
-            break
+    def video_frame_callback(frame):
+        image = frame.to_ndarray(format="bgr24")
 
         output, detections, highest = detect_weapons(
-            frame,
+            image,
             confidence_threshold
         )
 
         if detections:
-            consecutive += 1
+            state["consecutive"] += 1
         else:
-            consecutive = 0
+            state["consecutive"] = 0
 
         confirmed = (
-            consecutive >= required_frames
+            state["consecutive"] >= required_frames
         )
 
+        # Trigger one SMS when a new confirmed event starts.
+        if confirmed and not state["was_confirmed"] and SMS_ENABLED:
+            threading.Thread(
+                target=send_live_sms,
+                args=(highest,),
+                daemon=True
+            ).start()
+
         if confirmed:
-
-            # Send only once when a new confirmed event starts.
-            if not was_confirmed and SMS_ENABLED:
-                sms_message = build_alert_message(
-                    "Live Camera",
-                    highest
-                )
-                send_phone_alert(sms_message)
-
             output = add_banner(
                 output,
-                "🚨 WEAPON CONFIRMED",
+                "WEAPON DETECTED",
                 (0, 0, 180)
             )
-
-            now = time.time()
-
-            if now - last_log >= 5:
-
-                save_detection_log(
-                    "Live Camera",
-                    highest,
-                    len(detections)
-                )
-
-                last_log = now
-
         elif detections:
-
             output = add_banner(
                 output,
-                "VERIFYING...",
+                "VERIFYING POSSIBLE WEAPON...",
                 (0, 120, 220)
             )
-
         else:
-
             output = add_banner(
                 output,
                 "NO WEAPON DETECTED",
                 (0, 80, 0)
             )
 
-        was_confirmed = confirmed
+        state["was_confirmed"] = confirmed
 
-        cv2.imshow(
-            "WeaponGuard AI - LIVE DETECTION",
-            output
+        return av.VideoFrame.from_ndarray(
+            output,
+            format="bgr24"
         )
 
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q") or key == 27:
-            break
-
-    camera.release()
-    cv2.destroyAllWindows()
-
-    for _ in range(3):
-        cv2.waitKey(1)
-
-    st.success(
-        "🟢 Live Detection stopped."
+    st.caption(
+        "🔒 Camera access stays under your browser's permission. "
+        "For the deployed app, use the HTTPS Streamlit URL."
     )
+
+    webrtc_ctx = webrtc_streamer(
+        key="weaponguard-browser-live",
+        mode=WebRtcMode.SENDRECV,
+        video_frame_callback=video_frame_callback,
+        media_stream_constraints={
+            "video": True,
+            "audio": False
+        },
+        rtc_configuration={
+            "iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]}
+            ]
+        },
+        async_processing=True
+    )
+
+    if SMS_ENABLED:
+        st.success(
+            "📱 Twilio SMS alerts are enabled. A confirmed new weapon event "
+            "can trigger an SMS."
+        )
+    else:
+        st.info(
+            "📱 SMS alerts are disabled. Configure the Twilio environment "
+            "variables to receive phone alerts."
+        )
+
+    if webrtc_ctx.state.playing:
+        st.success(
+            "🟢 Live detection is running. Keep this tab open."
+        )
+    else:
+        st.info(
+            "Click START above to begin browser camera detection."
+        )
 
 
 # ============================================================
