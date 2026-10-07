@@ -15,12 +15,11 @@ from datetime import datetime
 
 try:
     import av
-    from streamlit_webrtc import WebRtcMode, VideoProcessorBase, webrtc_streamer
+    from streamlit_webrtc import WebRtcMode, webrtc_streamer
     WEBRTC_AVAILABLE = True
 except Exception:
     av = None
     WebRtcMode = None
-    VideoProcessorBase = object
     webrtc_streamer = None
     WEBRTC_AVAILABLE = False
 
@@ -59,22 +58,23 @@ TEAM_MEMBERS = [
     "S. Anusha"
 ]
 
-DEFAULT_CONFIDENCE = 0.25
-DEFAULT_REQUIRED_FRAMES = 2
+DEFAULT_CONFIDENCE = 0.45
+DEFAULT_REQUIRED_FRAMES = 3
 
-# Very small boxes are ignored. This helps reduce
-# random tiny false detections.
-MIN_BOX_AREA_RATIO = 0.0003
-
-# Live-camera performance and false-positive protection.
-# Live mode is intentionally stricter than image/video mode because
-# real-time webcam input is more sensitive to transient false detections.
-LIVE_CONFIDENCE_FLOOR = 0.60
+# Detection tuning. Image mode uses multi-scale agreement for better
+# recall without trusting a single noisy prediction. Video/live mode
+# additionally require temporal agreement before declaring a weapon.
+IMAGE_CONFIDENCE_FLOOR = 0.45
+VIDEO_CONFIDENCE_FLOOR = 0.50
+LIVE_CONFIDENCE_FLOOR = 0.55
+IMAGE_PRIMARY_IMGSZ = 640
+IMAGE_SECONDARY_IMGSZ = 960
+VIDEO_IMGSZ = 640
 LIVE_IMGSZ = 416
-LIVE_INFER_EVERY = 2
-LIVE_CONFIRM_WINDOW = 5
-LIVE_CONFIRM_HITS = 3
+MIN_BOX_AREA_RATIO = 0.0005
 LIVE_MIN_BOX_AREA_RATIO = 0.0010
+TEMPORAL_WINDOW = 5
+TEMPORAL_HITS = 3
 
 # Phone/SMS alert settings. Keep credentials in Windows environment
 # variables instead of writing them directly in app.py.
@@ -287,6 +287,11 @@ if not os.path.exists(MODEL_PATH):
     st.stop()
 
 model = load_model()
+MODEL_NAMES = {int(k): str(v) for k, v in model.names.items()}
+WEAPON_CLASS_ID = next((k for k, v in MODEL_NAMES.items() if v.lower().strip() == "weapon"), None)
+if WEAPON_CLASS_ID is None:
+    st.error(f"❌ This best.pt model does not contain a 'weapon' class. Loaded classes: {MODEL_NAMES}")
+    st.stop()
 
 
 # ============================================================
@@ -335,8 +340,8 @@ def save_detection_log(source, confidence, count=1):
 # PHONE / SMS ALERT
 # ============================================================
 
-def _send_twilio_sms(message):
-    """Low-level Twilio SMS sender. Safe to call outside Streamlit's script thread."""
+def send_phone_alert(message, force=False):
+    """Send an SMS using Twilio when a confirmed weapon event occurs."""
 
     if not SMS_ENABLED:
         return False, "SMS alerts are disabled."
@@ -353,6 +358,10 @@ def _send_twilio_sms(message):
 
     if missing:
         return False, "Missing environment variables: " + ", ".join(missing)
+
+    now = time.time()
+    if not force and now - st.session_state.last_sms_alert_time < SMS_COOLDOWN_SECONDS:
+        return False, "SMS cooldown is active."
 
     url = (
         "https://api.twilio.com/2010-04-01/Accounts/"
@@ -382,23 +391,11 @@ def _send_twilio_sms(message):
         with urllib.request.urlopen(request, timeout=15) as response:
             status = response.status
             if 200 <= status < 300:
+                st.session_state.last_sms_alert_time = now
                 return True, "SMS alert sent successfully."
             return False, f"Twilio returned HTTP {status}."
     except Exception as e:
         return False, f"SMS sending failed: {e}"
-
-
-def send_phone_alert(message, force=False):
-    """Send an SMS using Twilio with a Streamlit-session cooldown."""
-
-    now = time.time()
-    if not force and now - st.session_state.last_sms_alert_time < SMS_COOLDOWN_SECONDS:
-        return False, "SMS cooldown is active."
-
-    sent, status = _send_twilio_sms(message)
-    if sent:
-        st.session_state.last_sms_alert_time = now
-    return sent, status
 
 
 def build_alert_message(source, confidence, event_time=None):
@@ -420,79 +417,90 @@ def build_alert_message(source, confidence, event_time=None):
 # DETECT WEAPONS IN ONE FRAME
 # ============================================================
 
-def detect_weapons(frame, confidence_threshold):
+def _box_iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
 
-    output = frame.copy()
-    detections = []
 
+def _raw_weapon_detections(frame, confidence, imgsz, min_area_ratio=MIN_BOX_AREA_RATIO):
+    """Run YOLO and return only weapon boxes; no drawing is done here."""
     h, w = frame.shape[:2]
     frame_area = max(1, h * w)
-
     results = model(
         frame,
-        conf=confidence_threshold,
-        imgsz=640,
+        conf=confidence,
+        imgsz=imgsz,
+        classes=[WEAPON_CLASS_ID],
         verbose=False
     )
-
+    detections = []
     for result in results:
-
         if result.boxes is None:
             continue
-
         for box in result.boxes:
-
-            confidence = float(box.conf[0])
+            confidence_value = float(box.conf[0])
             class_id = int(box.cls[0])
             class_name = str(model.names[class_id]).lower().strip()
-
             if class_name != "weapon":
                 continue
-
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-
             box_area = max(0, x2 - x1) * max(0, y2 - y1)
-            area_ratio = box_area / frame_area
-
-            # Ignore extremely tiny detections.
-            if area_ratio < MIN_BOX_AREA_RATIO:
+            if box_area / frame_area < min_area_ratio:
                 continue
+            detections.append({"box": (x1, y1, x2, y2), "confidence": confidence_value})
+    return detections
 
-            detections.append({
-                "box": (x1, y1, x2, y2),
-                "confidence": confidence
-            })
 
-    # Draw every accepted weapon detection.
+def _draw_weapon_detections(frame, detections):
+    output = frame.copy()
     for det in detections:
-
         x1, y1, x2, y2 = det["box"]
         confidence = det["confidence"]
+        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        cv2.putText(output, f"WEAPON {confidence:.2f}", (x1, max(30, y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    return output
 
-        cv2.rectangle(
-            output,
-            (x1, y1),
-            (x2, y2),
-            (0, 0, 255),
-            3
-        )
 
-        cv2.putText(
-            output,
-            f"WEAPON {confidence:.2f}",
-            (x1, max(30, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 0, 255),
-            2
-        )
+def detect_weapons(frame, confidence_threshold, mode="image"):
+    """Reliable detector shared by image/video modes.
 
-    highest = max(
-        [d["confidence"] for d in detections],
-        default=0.0
-    )
-
-    return output, detections, highest
+    Image mode requires agreement between 640 and 960 inference when the
+    confidence is not already very high. Video mode uses a stricter floor;
+    temporal confirmation is handled by process_video.
+    """
+    if mode == "image":
+        floor = max(float(confidence_threshold), IMAGE_CONFIDENCE_FLOOR)
+        first = _raw_weapon_detections(frame, max(0.20, floor - 0.20), IMAGE_PRIMARY_IMGSZ)
+        second = _raw_weapon_detections(frame, max(0.20, floor - 0.20), IMAGE_SECONDARY_IMGSZ)
+        accepted = []
+        used = set()
+        for d1 in first:
+            matches = [(idx, d2) for idx, d2 in enumerate(second)
+                       if idx not in used and _box_iou(d1["box"], d2["box"]) >= 0.25]
+            if matches:
+                idx, d2 = max(matches, key=lambda x: x[1]["confidence"])
+                used.add(idx)
+                score = max(d1["confidence"], d2["confidence"])
+                if score >= floor:
+                    accepted.append({"box": d2["box"], "confidence": score})
+            elif d1["confidence"] >= 0.78:
+                accepted.append(d1)
+        detections = accepted
+    else:
+        floor = max(float(confidence_threshold), VIDEO_CONFIDENCE_FLOOR)
+        detections = _raw_weapon_detections(frame, floor, VIDEO_IMGSZ)
+    detections.sort(key=lambda d: d["confidence"], reverse=True)
+    highest = detections[0]["confidence"] if detections else 0.0
+    return _draw_weapon_detections(frame, detections), detections, highest
 
 
 # ============================================================
@@ -821,6 +829,7 @@ def process_video(
     was_confirmed = False
     highest_confidence = 0.0
     detection_events = []
+    recent_hits = deque(maxlen=TEMPORAL_WINDOW)
 
     progress = st.progress(0)
     status = st.empty()
@@ -838,18 +847,20 @@ def process_video(
 
             frame_number += 1
 
-            output, detections, highest = detect_weapons(
+            _, detections, highest = detect_weapons(
                 frame,
-                confidence_threshold
+                confidence_threshold,
+                mode="video"
             )
+            output = frame.copy()
+
+            # Require repeated evidence, not one noisy CCTV frame.
+            recent_hits.append(bool(detections))
+            hit_count = sum(recent_hits)
+            confirmed = len(recent_hits) >= TEMPORAL_WINDOW and hit_count >= max(required_frames, TEMPORAL_HITS)
 
             if detections:
-                consecutive_frames += 1
                 highest_confidence = max(highest_confidence, highest)
-            else:
-                consecutive_frames = 0
-
-            confirmed = consecutive_frames >= required_frames
 
             # Create exactly one event when a new confirmed detection starts.
             if confirmed and not was_confirmed:
@@ -869,6 +880,7 @@ def process_video(
             was_confirmed = confirmed
 
             if confirmed:
+                output = _draw_weapon_detections(frame, detections)
                 output = add_banner(
                     output,
                     "WEAPON DETECTED",
@@ -1082,7 +1094,8 @@ def image_detection(confidence_threshold):
             image_array,
             cv2.COLOR_RGB2BGR
         ),
-        confidence_threshold
+        confidence_threshold,
+        mode="image"
     )
 
     output_rgb = cv2.cvtColor(
@@ -1445,345 +1458,82 @@ def video_detection(
 
 
 # ============================================================
-# LIVE CAMERA - BROWSER WEBCAM
+# LIVE CAMERA
 # ============================================================
-def detect_live_weapons(frame, confidence_threshold):
-    """Fast/strict detector used only by the browser live camera.
-
-    It uses a smaller inference size for lower latency and a stricter
-    confidence/box-area filter to reduce webcam false positives.
-    """
-    output = frame.copy()
-    detections = []
-
-    h, w = frame.shape[:2]
-    frame_area = max(1, h * w)
-
-    live_conf = max(float(confidence_threshold), LIVE_CONFIDENCE_FLOOR)
-
-    # Keep the server-side inference image small enough for real-time use.
-    inference_frame = frame
-    max_width = 640
-    if w > max_width:
-        scale = max_width / float(w)
-        inference_frame = cv2.resize(
-            frame,
-            (max_width, max(1, int(h * scale))),
-            interpolation=cv2.INTER_AREA
-        )
-
-    results = model(
-        inference_frame,
-        conf=live_conf,
-        imgsz=LIVE_IMGSZ,
-        verbose=False
-    )
-
-    inf_h, inf_w = inference_frame.shape[:2]
-    sx = w / max(1, inf_w)
-    sy = h / max(1, inf_h)
-
-    for result in results:
-        if result.boxes is None:
-            continue
-
-        for box in result.boxes:
-            confidence = float(box.conf[0])
-            class_id = int(box.cls[0])
-            class_name = str(model.names[class_id]).lower().strip()
-
-            if class_name != "weapon":
-                continue
-
-            ix1, iy1, ix2, iy2 = map(int, box.xyxy[0])
-
-            x1 = max(0, min(w - 1, int(ix1 * sx)))
-            y1 = max(0, min(h - 1, int(iy1 * sy)))
-            x2 = max(0, min(w - 1, int(ix2 * sx)))
-            y2 = max(0, min(h - 1, int(iy2 * sy)))
-
-            box_area = max(0, x2 - x1) * max(0, y2 - y1)
-            area_ratio = box_area / frame_area
-
-            # Ignore tiny/transient regions that are commonly produced
-            # around faces, ears, background objects, etc.
-            if area_ratio < LIVE_MIN_BOX_AREA_RATIO:
-                continue
-
-            detections.append({
-                "box": (x1, y1, x2, y2),
-                "confidence": confidence
-            })
-
-    highest = max(
-        [d["confidence"] for d in detections],
-        default=0.0
-    )
-
-    return output, detections, highest
-
-
 
 def live_detection(confidence_threshold, required_frames):
-    """Low-latency browser webcam detection using WebRTC."""
-
-    st.markdown(
-        """
-        <div class="wg-card" style="margin-top:8px;">
-            <div style="font-size:26px;font-weight:800;margin-bottom:6px;">
-                📹 Live Camera Detection
-            </div>
-            <div class="wg-small">
-                Real-time YOLO detection from your browser camera.
-                Live mode uses a stricter filter to avoid false alarms
-                from faces, ears, fans, and background objects.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    """Browser webcam detection with temporal confirmation and low latency."""
+    st.subheader("📹 Live Camera Detection")
 
     if not WEBRTC_AVAILABLE:
-        st.error(
-            "⚠️ Live camera is not available. Add `streamlit-webrtc` "
-            "and `av` to requirements.txt and redeploy."
-        )
+        st.error("Live camera requires streamlit-webrtc and av in requirements.txt.")
         return
 
-    # Use a bounded history instead of trusting one webcam frame.
-    # A detection must be present in 3 of the last 5 inference frames.
-    state = {
-        "frame_count": 0,
-        "history": deque(maxlen=LIVE_CONFIRM_WINDOW),
-        "last_confirmed_box": None,
-        "last_confirmed_conf": 0.0,
-        "was_confirmed": False,
-        "last_alert_time": 0.0
-    }
-    alert_lock = threading.Lock()
+    st.info("Live mode uses browser camera input. A single frame can never trigger a weapon alert.")
+    state = {"frame": 0, "history": deque(maxlen=TEMPORAL_WINDOW),
+             "was_confirmed": False, "last_alert": 0.0}
+    lock = threading.Lock()
 
-    def send_live_sms(confidence):
+    def send_sms(confidence):
         now = time.time()
-
-        with alert_lock:
-            if now - state["last_alert_time"] < SMS_COOLDOWN_SECONDS:
+        with lock:
+            if now - state["last_alert"] < SMS_COOLDOWN_SECONDS:
                 return
-            state["last_alert_time"] = now
+            state["last_alert"] = now
+        _send_twilio_sms(build_alert_message("Browser Live Camera", confidence))
 
-        message = build_alert_message(
-            "Browser Live Camera",
-            confidence
-        )
-
-        sent, _ = _send_twilio_sms(message)
-
-        if sent:
-            save_detection_log(
-                "Browser Live Camera",
-                confidence,
-                1
-            )
-
-    def video_frame_callback(frame):
+    def callback(frame):
         image = frame.to_ndarray(format="bgr24")
-        state["frame_count"] += 1
-
-        # IMPORTANT FOR LOW LATENCY:
-        # Do not let slow YOLO inference run on every camera frame.
-        # The WebRTC worker is synchronous, so frames do not build up
-        # behind a long inference queue.
-        run_inference = (
-            state["frame_count"] == 1
-            or state["frame_count"] % LIVE_INFER_EVERY == 0
-        )
-
-        if run_inference:
-            _, detections, highest = detect_live_weapons(
+        state["frame"] += 1
+        # Process every second frame to reduce delay while keeping the camera fluid.
+        if state["frame"] % 2 == 0 or not state["history"]:
+            detections = _raw_weapon_detections(
                 image,
-                confidence_threshold
+                max(float(confidence_threshold), LIVE_CONFIDENCE_FLOOR),
+                LIVE_IMGSZ,
+                min_area_ratio=LIVE_MIN_BOX_AREA_RATIO
             )
+            state["history"].append(detections)
 
-            state["history"].append(
-                {
-                    "detected": bool(detections),
-                    "confidence": highest,
-                    "box": detections[0]["box"] if detections else None
-                }
-            )
+        hit_count = sum(bool(x) for x in state["history"])
+        confirmed = len(state["history"]) >= TEMPORAL_WINDOW and hit_count >= max(required_frames, TEMPORAL_HITS)
 
-        recent = list(state["history"])
-        hit_count = sum(1 for item in recent if item["detected"])
-
-        confirmed = (
-            len(recent) >= LIVE_CONFIRM_WINDOW
-            and hit_count >= LIVE_CONFIRM_HITS
-        )
-
-        # Only show a detection box after temporal confirmation.
         if confirmed:
-            confirmed_items = [
-                item for item in recent
-                if item["detected"]
-            ]
-
-            best_item = max(
-                confirmed_items,
-                key=lambda item: item["confidence"]
-            )
-
-            state["last_confirmed_box"] = best_item["box"]
-            state["last_confirmed_conf"] = best_item["confidence"]
-
-            x1, y1, x2, y2 = state["last_confirmed_box"]
-
-            cv2.rectangle(
-                image,
-                (x1, y1),
-                (x2, y2),
-                (0, 0, 255),
-                3
-            )
-
-            cv2.putText(
-                image,
-                f"WEAPON {state['last_confirmed_conf']:.2f}",
-                (x1, max(30, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 0, 255),
-                2
-            )
-
-            image = add_banner(
-                image,
-                "WEAPON DETECTED",
-                (0, 0, 180)
-            )
-
-            if not state["was_confirmed"] and SMS_ENABLED:
-                threading.Thread(
-                    target=send_live_sms,
-                    args=(state["last_confirmed_conf"],),
-                    daemon=True
-                ).start()
-
+            best = max((d for group in state["history"] for d in group),
+                       key=lambda d: d["confidence"], default=None)
+            output = _draw_weapon_detections(image, [best] if best else [])
+            output = add_banner(output, "WEAPON DETECTED", (0, 0, 180))
+            if not state["was_confirmed"] and best and SMS_ENABLED:
+                threading.Thread(target=send_sms, args=(best["confidence"],), daemon=True).start()
+        elif state["history"] and state["history"][-1]:
+            output = add_banner(image.copy(), "VERIFYING...", (0, 105, 210))
         else:
-            # Do not carry an old box into the current camera frame.
-            state["last_confirmed_box"] = None
-
-            if recent and recent[-1]["detected"]:
-                image = add_banner(
-                    image,
-                    "VERIFYING...",
-                    (0, 105, 210)
-                )
-            else:
-                image = add_banner(
-                    image,
-                    "NO WEAPON DETECTED",
-                    (0, 80, 0)
-                )
+            output = add_banner(image.copy(), "NO WEAPON DETECTED", (0, 80, 0))
 
         state["was_confirmed"] = confirmed
-
-        return av.VideoFrame.from_ndarray(
-            image,
-            format="bgr24"
-        )
-
-    st.markdown("### 🎥 Your Camera")
-
-    st.caption(
-        "Click START and allow camera access. "
-        "Live mode is optimized to minimize delay and false alarms."
-    )
+        return av.VideoFrame.from_ndarray(output, format="bgr24")
 
     webrtc_ctx = webrtc_streamer(
-        key="weaponguard-browser-live-v3",
+        key="weaponguard-browser-live-v4",
         mode=WebRtcMode.SENDRECV,
-        video_frame_callback=video_frame_callback,
-
-        # Lower camera FPS reduces network/CPU load without making
-        # the display feel slow.
+        video_frame_callback=callback,
         media_stream_constraints={
-            "video": {
-                "width": {"ideal": 640, "max": 640},
-                "height": {"ideal": 480, "max": 480},
-                "frameRate": {"ideal": 15, "max": 15}
-            },
+            "video": {"width": {"ideal": 640, "max": 640},
+                      "height": {"ideal": 480, "max": 480},
+                      "frameRate": {"ideal": 15, "max": 15}},
             "audio": False
         },
-
-        rtc_configuration={
-            "iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]}
-            ]
-        },
-
-        # Synchronous processing prevents a slow YOLO callback from
-        # accumulating old frames and producing a 1–2 second delay.
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         async_processing=False,
-
         media_toggle_controls=False
     )
 
-    st.markdown("### 🛡️ Live Detection Status")
-
     if webrtc_ctx.state.playing:
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            st.success("🟢 CAMERA ACTIVE")
-
-        with c2:
-            st.success("🤖 YOLO ACTIVE")
-
-        with c3:
-            st.success(
-                f"🎯 LIVE FILTER ≥ {max(confidence_threshold, LIVE_CONFIDENCE_FLOOR):.0%}"
-            )
+        st.success(f"🟢 CAMERA ACTIVE • YOLO ACTIVE • LIVE FILTER ≥ {max(confidence_threshold, LIVE_CONFIDENCE_FLOOR):.0%}")
     else:
-        c1, c2, c3 = st.columns(3)
+        st.info("⚪ Camera ready — click START and allow camera access.")
 
-        with c1:
-            st.info("⚪ CAMERA READY")
-
-        with c2:
-            st.info("🤖 YOLO READY")
-
-        with c3:
-            st.info(
-                f"🎯 LIVE FILTER ≥ {max(confidence_threshold, LIVE_CONFIDENCE_FLOOR):.0%}"
-            )
-
-    st.markdown(
-        f"""
-        <div class="wg-card" style="margin-top:14px;">
-            <div style="font-size:18px;font-weight:700;margin-bottom:8px;">
-                ⚙️ Live Performance Settings
-            </div>
-            <div class="wg-small">
-                🎯 Minimum live confidence:
-                <b>{max(confidence_threshold, LIVE_CONFIDENCE_FLOOR):.0%}</b>
-                &nbsp; • &nbsp;
-                🔍 Inference size:
-                <b>{LIVE_IMGSZ}</b>
-                &nbsp; • &nbsp;
-                🎞️ Confirmation:
-                <b>{LIVE_CONFIRM_HITS} of {LIVE_CONFIRM_WINDOW}</b>
-                &nbsp; • &nbsp;
-                📷 Camera:
-                <b>640×480 @ 15 FPS</b>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.info(
-        "ℹ️ Live mode is intentionally stricter than Image/Video Detection. "
-        "A single frame is never enough to trigger WEAPON DETECTED."
-    )
+    st.caption("Live: 640×480 @ 15 FPS • YOLO 416 • confirmation: 3 of 5 inference frames")
 
 
 # ============================================================
@@ -1791,32 +1541,45 @@ def live_detection(confidence_threshold, required_frames):
 # ============================================================
 
 def show_logs():
-    """Display saved weapon-detection events safely."""
+
     st.subheader("📋 Detection Logs")
 
     if not os.path.exists(LOG_FILE):
+
         st.info("No detection logs yet.")
         return
 
     try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
+
+        with open(
+            LOG_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             logs = json.load(f)
 
         if isinstance(logs, dict):
-            logs = logs.get("detections", [logs])
+            logs = logs.get(
+                "detections",
+                [logs]
+            )
 
-        if not isinstance(logs, list) or not logs:
+        if not logs:
+
             st.info("No detection logs yet.")
             return
 
         st.dataframe(
             list(reversed(logs)),
-            use_container_width=True,
-            hide_index=True
+            use_container_width=True
         )
 
-    except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
-        st.warning(f"Could not read detection logs: {e}")
+    except Exception as e:
+
+        st.warning(
+            f"Could not read logs: {e}"
+        )
 
 
 # ============================================================
@@ -1850,7 +1613,7 @@ def detection_page():
 
         confidence = st.slider(
             "🎯 Confidence Threshold",
-            min_value=0.15,
+            min_value=0.30,
             max_value=0.95,
             value=DEFAULT_CONFIDENCE,
             step=0.05
@@ -1865,8 +1628,8 @@ def detection_page():
         )
 
         st.caption(
-            "Higher confidence + more consecutive frames "
-            "can reduce false alarms."
+            "Image uses multi-scale agreement. Video/live require repeated evidence. "
+            "Higher confidence reduces false alarms."
         )
 
         st.divider()
