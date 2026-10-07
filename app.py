@@ -9,7 +9,19 @@ import time
 import urllib.parse
 import urllib.request
 import base64
+import threading
 from datetime import datetime
+
+# Browser webcam support for Streamlit Cloud / remote deployment.
+try:
+    import av
+    from streamlit_webrtc import WebRtcMode, webrtc_streamer
+    WEBRTC_AVAILABLE = True
+except Exception:
+    av = None
+    WebRtcMode = None
+    webrtc_streamer = None
+    WEBRTC_AVAILABLE = False
 
 import numpy as np
 from PIL import Image
@@ -1424,110 +1436,111 @@ def video_detection(
 # LIVE CAMERA
 # ============================================================
 
+def _send_twilio_sms_direct(message):
+    """Thread-safe Twilio SMS sender for the WebRTC callback."""
+    if not SMS_ENABLED:
+        return False
+
+    if not (
+        TWILIO_ACCOUNT_SID
+        and TWILIO_AUTH_TOKEN
+        and TWILIO_FROM_NUMBER
+        and ALERT_TO_NUMBER
+    ):
+        return False
+
+    url = (
+        "https://api.twilio.com/2010-04-01/Accounts/"
+        f"{TWILIO_ACCOUNT_SID}/Messages.json"
+    )
+
+    payload = urllib.parse.urlencode({
+        "From": TWILIO_FROM_NUMBER,
+        "To": ALERT_TO_NUMBER,
+        "Body": message[:1500]
+    }).encode("utf-8")
+
+    credentials = f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")
+    auth = base64.b64encode(credentials).decode("ascii")
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
 def live_detection(
     confidence_threshold,
     required_frames
 ):
+    """Browser webcam detection using WebRTC.
+
+    cv2.VideoCapture(0) cannot access the user's webcam when the app is
+    deployed remotely. WebRTC requests the camera from the user's browser.
+    """
 
     st.subheader("📹 Live Camera Detection")
 
-    st.info(
-        """
-        This version uses OpenCV directly.
-        Click START LIVE DETECTION to open your webcam.
-        Press Q or ESC inside the camera window to stop.
-        """
-    )
-
-    if not st.button(
-        "📹 START LIVE DETECTION",
-        type="primary",
-        use_container_width=True,
-        key="start_live"
-    ):
-        return
-
-    camera = cv2.VideoCapture(
-        0,
-        cv2.CAP_DSHOW
-    )
-
-    if not camera.isOpened():
-
-        camera.release()
-
-        camera = cv2.VideoCapture(
-            1,
-            cv2.CAP_DSHOW
-        )
-
-    if not camera.isOpened():
-
+    if not WEBRTC_AVAILABLE:
         st.error(
-            """
-            ❌ Could not open webcam.
-
-            Check Windows camera permission and make sure
-            another application is not using the camera.
-            """
+            "❌ Browser webcam support is not installed. "
+            "Add streamlit-webrtc and av to requirements.txt, then redeploy."
         )
-
         return
 
-    camera.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        640
+    st.info(
+        "Click START below. Your browser will ask for camera permission. "
+        "Choose Allow to use your webcam."
     )
 
-    camera.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        480
-    )
+    state = {
+        "consecutive": 0,
+        "was_confirmed": False,
+        "last_log": 0.0,
+        "last_sms": 0.0,
+        "frame_count": 0,
+    }
 
-    camera.set(
-        cv2.CAP_PROP_FPS,
-        30
-    )
+    inference_lock = threading.Lock()
 
-    consecutive = 0
-    last_log = 0
-    was_confirmed = False
+    def video_frame_callback(frame):
+        img = frame.to_ndarray(format="bgr24")
+        state["frame_count"] += 1
 
-    st.success(
-        "🟢 Camera started. Press Q or ESC to stop."
-    )
+        # Run YOLO on alternate frames to keep the browser feed responsive.
+        if state["frame_count"] % 2 == 0:
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-    while True:
+        if not inference_lock.acquire(blocking=False):
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-        success, frame = camera.read()
-
-        if not success:
-            break
-
-        output, detections, highest = detect_weapons(
-            frame,
-            confidence_threshold
-        )
+        try:
+            output, detections, highest = detect_weapons(
+                img,
+                confidence_threshold
+            )
+        finally:
+            inference_lock.release()
 
         if detections:
-            consecutive += 1
+            state["consecutive"] += 1
         else:
-            consecutive = 0
+            state["consecutive"] = 0
 
-        confirmed = (
-            consecutive >= required_frames
-        )
+        confirmed = state["consecutive"] >= required_frames
 
         if confirmed:
-
-            # Send only once when a new confirmed event starts.
-            if not was_confirmed and SMS_ENABLED:
-                sms_message = build_alert_message(
-                    "Live Camera",
-                    highest
-                )
-                send_phone_alert(sms_message)
-
             output = add_banner(
                 output,
                 "🚨 WEAPON CONFIRMED",
@@ -1536,53 +1549,97 @@ def live_detection(
 
             now = time.time()
 
-            if now - last_log >= 5:
-
+            if now - state["last_log"] >= 5:
                 save_detection_log(
                     "Live Camera",
                     highest,
                     len(detections)
                 )
+                state["last_log"] = now
 
-                last_log = now
+            if (
+                not state["was_confirmed"]
+                and SMS_ENABLED
+                and now - state["last_sms"] >= SMS_COOLDOWN_SECONDS
+            ):
+                message = build_alert_message(
+                    "Live Camera",
+                    highest
+                )
+                state["last_sms"] = now
+                threading.Thread(
+                    target=_send_twilio_sms_direct,
+                    args=(message,),
+                    daemon=True
+                ).start()
 
         elif detections:
-
             output = add_banner(
                 output,
                 "VERIFYING...",
                 (0, 120, 220)
             )
-
         else:
-
             output = add_banner(
                 output,
                 "NO WEAPON DETECTED",
                 (0, 80, 0)
             )
 
-        was_confirmed = confirmed
+        state["was_confirmed"] = confirmed
+        return av.VideoFrame.from_ndarray(output, format="bgr24")
 
-        cv2.imshow(
-            "WeaponGuard AI - LIVE DETECTION",
-            output
+    try:
+        ctx = webrtc_streamer(
+            key="weaponguard-browser-live-v2",
+            mode=WebRtcMode.SENDRECV,
+            video_frame_callback=video_frame_callback,
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 15, "max": 20},
+                },
+                "audio": False,
+            },
+            rtc_configuration={
+                "iceServers": [
+                    {"urls": ["stun:stun.l.google.com:19302"]}
+                ]
+            },
+            async_processing=False,
+            media_stream_constraints_timeout=10,
+        )
+    except TypeError:
+        ctx = webrtc_streamer(
+            key="weaponguard-browser-live-v2",
+            mode=WebRtcMode.SENDRECV,
+            video_frame_callback=video_frame_callback,
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 15, "max": 20},
+                },
+                "audio": False,
+            },
+            rtc_configuration={
+                "iceServers": [
+                    {"urls": ["stun:stun.l.google.com:19302"]}
+                ]
+            },
+            async_processing=False,
         )
 
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q") or key == 27:
-            break
-
-    camera.release()
-    cv2.destroyAllWindows()
-
-    for _ in range(3):
-        cv2.waitKey(1)
-
-    st.success(
-        "🟢 Live Detection stopped."
-    )
+    if ctx.state.playing:
+        st.success(
+            "🟢 Webcam is connected. The browser camera feed is being analyzed."
+        )
+    else:
+        st.caption(
+            "If the camera does not start, click START and choose Allow "
+            "when Chrome asks for camera permission."
+        )
 
 
 # ============================================================
